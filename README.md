@@ -19,8 +19,10 @@ A Go service for managing fleets of OpenClaw agents.
 - **Backbone:** PostgreSQL + RabbitMQ
 - **Purpose:** Control plane for OpenClaw agents across teams
 - **Features:** Scoped permissions, health checks, audit trails, approval gates
+- **Deployment:** Kubernetes-native with CRDs and Operator
 
 [See AGENT_PLATFORM.md](AGENT_PLATFORM.md)
+[See KUBERNETES_DEPLOYMENT.md](KUBERNETES_DEPLOYMENT.md) for K8s architecture
 
 ## Shared Infrastructure
 
