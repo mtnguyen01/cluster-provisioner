@@ -1,896 +1,710 @@
-# Cluster Provisioner Service — Architecture Plan v2
+# OpenClaw Agent Management Platform — Architecture Plan
 
-**Goal:** A production Go service that provisions Kubernetes clusters on multiple hosting providers.
+**Goal:** A production Go service for managing a fleet of OpenClaw agents across teams and use cases.
 **Backbone:** PostgreSQL + RabbitMQ
-**Inspiration:** `poc-hetzner` (Talos on Hetzner/Scaleway/Vultr with VPN, CNI, ingress)
-
 **Date:** 2026-05-13
 
 ---
 
-## 1. Why Not Cluster API?
+## 1. Problem Statement
 
-[Cluster API (CAPI)](https://cluster-api.sigs.k8s.io/) already exists with providers for Hetzner ([CAPH](https://github.com/syself/cluster-api-provider-hetzner)) and others. We evaluated it and decided against it because:
+Engineers run multiple OpenClaw instances but lack:
+- Centralized agent lifecycle management
+- Scoped permissions per agent
+- Health monitoring and auto-restart
+- Audit trails for every agent action
+- Git-managed configuration
+- Approval gates for dangerous operations
 
-1. **CAPI runs inside Kubernetes.** We want a standalone service that doesn't require a management cluster.
-2. **Talos-specific needs.** Rescue mode, raw image flashing, and provider-specific quirks (Scaleway's IAM SSH keys, Vultr's VPC attachment) don't fit CAPI's declarative model cleanly.
-3. **Addon orchestration.** We need Helm-based addon installation (Cilium, Envoy Gateway, cert-manager) with dependency ordering and config templating — outside CAPI's scope.
-4. **Multi-provider abstraction.** We want a single API that abstracts Hetzner, Scaleway, Vultr, and future providers with unified networking/VPN patterns.
-
-**Trade-off:** We hand-roll the reconciler and state model. This is acceptable for a focused service with ~3 providers and ~3 cluster types.
+**This platform is the control plane for OpenClaw agents.**
 
 ---
 
-## 2. Production Backbone
+## 2. Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    Cluster Provisioner Service                      │
-│                     (Go, multi-replica capable)                     │
+│              OpenClaw Agent Management Platform                     │
+│                    (Go, multi-replica capable)                      │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
               ┌─────────────────┼─────────────────┐
               │                 │                 │
               ▼                 ▼                 ▼
        ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-       │   PostgreSQL │ │   RabbitMQ   │ │   Vault      │
-       │   (state)    │ │   (events)   │ │  (secrets)   │
+       │  PostgreSQL  │ │   RabbitMQ   │ │    Vault     │
+       │   (state)    │ │  (events)    │ │  (secrets)   │
        └──────────────┘ └──────────────┘ └──────────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+        ▼                       ▼                       ▼
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Gateway    │      │   Agent 1    │      │   Agent N    │
+│  (Control)   │      │  (ops-agent) │      │(support-agent│
+└──────────────┘      └──────────────┘      └──────────────┘
+        │                       │                       │
+        └───────────────────────┼───────────────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────┐
+                    │  External Services  │
+                    │  (Telegram, Discord,│
+                    │   Slack, Email,     │
+                    │   Calendar, etc.)   │
+                    └─────────────────────┘
 ```
-
-| Component | Role | Why |
-|-----------|------|-----|
-| **PostgreSQL** | Primary state store | ACID transactions, querying, migrations, multi-replica safe |
-| **RabbitMQ** | Event bus + work queue | Durable task queues, pub/sub for events, dead-letter for retries |
-| **HashiCorp Vault** | Secret management | Kubeconfig, cloud API tokens, SSH keys — never in DB plaintext |
 
 ---
 
-## 3. Architecture Layers
+## 3. Core Principles
 
-```
-┌─────────────────────────────────────────────────────────┐
-│              API Layer (gRPC + REST)                    │
-│  CreateCluster, GetCluster, DeleteCluster, StreamEvents │
-├─────────────────────────────────────────────────────────┤
-│           Reconciler (declarative, not imperative)      │
-│  Diff desired vs observed state, emit tasks, converge   │
-├─────────────────────────────────────────────────────────┤
-│           Task Engine (River / Asynq over RabbitMQ)     │
-│  Durable execution: tasks survive process restarts      │
-├─────────────────────────────────────────────────────────┤
-│           Capability-Based Provider Interface           │
-│  VM lifecycler, Networker, RescueBootable, etc.       │
-├─────────────────────────────────────────────────────────┤
-│           Cluster Engine Interface                      │
-│  Talos, k3s, RKE2 — each with its own reconcile plan   │
-├─────────────────────────────────────────────────────────┤
-│           Addon Manager (with dependencies)             │
-│  Ordered install: CNI → CCM → Ingress → CertManager   │
-├─────────────────────────────────────────────────────────┤
-│           Cloud SDKs (Go libraries, not shell)          │
-│  Hetzner SDK, Scaleway SDK, Vultr SDK                   │
-└─────────────────────────────────────────────────────────┘
-```
+| Principle | Implementation |
+|-----------|---------------|
+| **One Gateway, many agents** | Gateway routes traffic to named agents via bindings |
+| **Separation by responsibility** | Each agent has a specific role (ops, mail, calendar, support) |
+| **Scoped permissions** | Each agent only has tools it needs — no shell for calendar agent |
+| **Health checks & restarts** | Docker Compose / systemd / K8s with auto-restart |
+| **Reproducible state** | Config in Git: agents are "config + runtime state," not pets |
+| **Approval gates** | Dangerous actions require explicit approval |
+| **Full observability** | Logs, metrics, audit trails for every run |
 
 ---
 
 ## 4. Data Model (PostgreSQL)
 
-### 4.1 clusters
+### 4.1 agents
 
 ```sql
-CREATE TABLE clusters (
+CREATE TABLE agents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL UNIQUE,
-    provider TEXT NOT NULL,       -- 'hetzner', 'scaleway', 'vultr'
-    region TEXT NOT NULL,
-    cluster_type TEXT NOT NULL,   -- 'talos', 'k3s', 'rke2'
+    name TEXT NOT NULL UNIQUE,        -- "ops-agent", "mail-agent"
+    display_name TEXT,                 -- "Operations Agent"
+    description TEXT,
     
-    control_planes INT NOT NULL DEFAULT 1,
-    workers INT NOT NULL DEFAULT 1,
+    -- Classification
+    role TEXT NOT NULL,                -- "ops", "mail", "calendar", "support", "devops", "finance"
+    team TEXT,                         -- "platform", "customer-success", "engineering"
     
-    vpc_cidr TEXT,
-    use_private_ip BOOLEAN DEFAULT true,
-    vpn_type TEXT,                -- 'netbird', 'tailscale', 'headscale', null
+    -- Configuration
+    config JSONB NOT NULL,             -- agent definition, prompts, model settings
+    bindings JSONB DEFAULT '[]',       -- channel bindings: [{"channel": "telegram", "target": "..."}]
+    
+    -- Permissions
+    allowed_tools TEXT[] DEFAULT '{}', -- ["web_search", "message", "read"]
+    denied_tools TEXT[] DEFAULT '{}',  -- ["exec", "gateway"]
+    
+    -- Approval gates
+    require_approval_for TEXT[] DEFAULT '{"exec", "message", "gateway"}',
     
     -- State
-    phase TEXT NOT NULL DEFAULT 'Pending',
-    current_step TEXT,            -- exact resumable step
-    conditions JSONB DEFAULT '{}', -- { "NetworkReady": true, "NodesReady": false }
-    failure_reason TEXT,
-    retry_count INT DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'inactive', -- inactive, active, error, paused
+    last_heartbeat TIMESTAMPTZ,
     last_error TEXT,
     
-    -- Endpoints (not secrets)
-    public_endpoint TEXT,
-    private_endpoint TEXT,
-    
-    -- Metadata
-    spec JSONB NOT NULL,          -- full user spec
-    state JSONB DEFAULT '{}',     -- provider-specific runtime state
+    -- Runtime
+    workspace_path TEXT,               -- /var/lib/openclaw/agents/ops-agent
+    pid INT,                           -- process ID
+    version TEXT,                      -- OpenClaw version
     
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ,
-    deleted_at TIMESTAMPTZ        -- soft delete
+    deleted_at TIMESTAMPTZ             -- soft delete
 );
 
-CREATE INDEX idx_clusters_phase ON clusters(phase);
-CREATE INDEX idx_clusters_provider ON clusters(provider);
-CREATE INDEX idx_clusters_expires_at ON clusters(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_agents_role ON agents(role);
+CREATE INDEX idx_agents_status ON agents(status);
+CREATE INDEX idx_agents_team ON agents(team);
 ```
 
-### 4.2 nodes
+### 4.2 agent_runs (audit trail)
 
 ```sql
-CREATE TABLE nodes (
+CREATE TABLE agent_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cluster_id UUID NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    role TEXT NOT NULL,           -- 'control-plane', 'worker', 'vpn'
+    agent_id UUID NOT NULL REFERENCES agents(id),
     
-    -- IPs
-    public_ip INET,
-    private_ip INET,
-    vpn_ip INET,
+    -- Trigger
+    trigger_type TEXT NOT NULL,        -- "message", "cron", "heartbeat", "manual"
+    trigger_source TEXT,               -- "telegram:8756405644", "cron:backup-check"
+    trigger_user TEXT,                 -- who triggered it
     
-    -- Provider
-    provider_id TEXT,             -- cloud VM ID
-    provider_state JSONB,         -- provider-specific VM metadata
+    -- Execution
+    model TEXT,                        -- "kimi/kimi-code", "anthropic/claude-opus-4-7"
+    session_key TEXT,                  -- OpenClaw session identifier
     
-    -- State
-    status TEXT NOT NULL DEFAULT 'Creating',
+    -- Tools used
+    tools_called JSONB DEFAULT '[]',   -- [{"tool": "exec", "args": "...", "result": "..."}]
     
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ,
-    
-    UNIQUE(cluster_id, name)
-);
-
-CREATE INDEX idx_nodes_cluster_id ON nodes(cluster_id);
-```
-
-### 4.3 resources (VMs, networks, volumes, load balancers)
-
-```sql
-CREATE TABLE resources (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cluster_id UUID NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
-    node_id UUID REFERENCES nodes(id) ON DELETE SET NULL,
-    
-    resource_type TEXT NOT NULL,  -- 'vm', 'network', 'volume', 'firewall', 'loadbalancer', 'ssh_key'
-    provider TEXT NOT NULL,
-    provider_id TEXT NOT NULL,    -- cloud resource ID
-    
-    -- For cleanup tracking
-    name TEXT NOT NULL,
-    metadata JSONB DEFAULT '{}',
-    
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ,
-    
-    UNIQUE(provider, provider_id)
-);
-
-CREATE INDEX idx_resources_cluster_id ON resources(cluster_id);
-CREATE INDEX idx_resources_type ON resources(resource_type);
-```
-
-### 4.4 addons
-
-```sql
-CREATE TABLE addons (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cluster_id UUID NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    version TEXT,
-    config JSONB DEFAULT '{}',
-    
-    status TEXT NOT NULL DEFAULT 'Pending',
-    installed_at TIMESTAMPTZ,
-    
-    UNIQUE(cluster_id, name)
-);
-
-CREATE INDEX idx_addons_cluster_id ON addons(cluster_id);
-```
-
-### 4.5 tasks (for River/Asynq integration)
-
-```sql
-CREATE TABLE tasks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cluster_id UUID NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
-    
-    task_type TEXT NOT NULL,      -- 'create_vm', 'install_cni', 'bootstrap_etcd'
-    payload JSONB NOT NULL,
-    
-    status TEXT NOT NULL DEFAULT 'Pending',
-    attempts INT DEFAULT 0,
-    max_attempts INT DEFAULT 3,
-    
-    scheduled_at TIMESTAMPTZ DEFAULT NOW(),
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
+    -- Result
+    status TEXT NOT NULL,              -- running, completed, failed, approval_pending
+    output TEXT,                       -- agent response
     error_message TEXT,
     
-    -- For ordering within a cluster
-    depends_on UUID[],
+    -- Metrics
+    prompt_tokens INT,
+    completion_tokens INT,
+    cost_usd DECIMAL(10,6),
+    duration_ms INT,
+    
+    -- Approval
+    approval_required BOOLEAN DEFAULT false,
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
     
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_tasks_cluster_id ON tasks(cluster_id);
-CREATE INDEX idx_tasks_status_scheduled ON tasks(status, scheduled_at);
+CREATE INDEX idx_runs_agent_id ON agent_runs(agent_id);
+CREATE INDEX idx_runs_status ON agent_runs(status);
+CREATE INDEX idx_runs_trigger ON agent_runs(trigger_type, trigger_source);
+CREATE INDEX idx_runs_started ON agent_runs(started_at);
+```
+
+### 4.3 agent_events
+
+```sql
+CREATE TABLE agent_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    
+    event_type TEXT NOT NULL,          -- heartbeat, started, stopped, error, tool_called, approved
+    severity TEXT DEFAULT 'info',      -- debug, info, warning, error, critical
+    
+    payload JSONB,                     -- event-specific data
+    
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_events_agent_id ON agent_events(agent_id);
+CREATE INDEX idx_events_type ON agent_events(event_type);
+CREATE INDEX idx_events_created ON agent_events(created_at);
+```
+
+### 4.4 agent_configs (Git-managed)
+
+```sql
+CREATE TABLE agent_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    
+    config_type TEXT NOT NULL,         -- "agent_json", "prompts", "tools", "bindings"
+    content TEXT NOT NULL,             -- JSON/YAML content
+    
+    -- Git tracking
+    git_commit TEXT,
+    git_branch TEXT,
+    synced_at TIMESTAMPTZ,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 4.5 approvals
+
+```sql
+CREATE TABLE approvals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id UUID NOT NULL REFERENCES agent_runs(id),
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    
+    action_type TEXT NOT NULL,         -- "exec", "message", "gateway", "delete"
+    action_details JSONB NOT NULL,     -- { "command": "rm -rf /", "reason": "cleanup" }
+    
+    requested_by TEXT NOT NULL,        -- agent name
+    requested_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    rejection_reason TEXT,
+    
+    status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected, expired
+    expires_at TIMESTAMPTZ,            -- auto-expire if not acted on
+    
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_approvals_status ON approvals(status);
+CREATE INDEX idx_approvals_run_id ON approvals(run_id);
+CREATE INDEX idx_approvals_expires ON approvals(expires_at) WHERE status = 'pending';
+```
+
+### 4.6 channels (external service bindings)
+
+```sql
+CREATE TABLE channels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL UNIQUE,         -- "telegram-prod", "discord-team"
+    
+    channel_type TEXT NOT NULL,        -- "telegram", "discord", "slack", "email"
+    config JSONB NOT NULL,             -- { "token": "...", "webhook": "..." }
+    
+    -- Binding to agent
+    agent_id UUID REFERENCES agents(id),
+    binding_rules JSONB DEFAULT '{}',  -- routing rules
+    
+    status TEXT DEFAULT 'active',
+    
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 ```
 
 ---
 
-## 5. Provider Interface (Capability-Based)
+## 5. Service Components
 
-Instead of a monolithic interface, providers implement **capability interfaces**.
+### 5.1 Gateway (Control Point)
 
-```go
-package providers
-
-// Base — every provider must implement
-type Provider interface {
-    Name() string
-    Capabilities() Capabilities
-}
-
-type Capabilities struct {
-    HasVMLifecycle      bool
-    HasRescueMode       bool
-    HasCustomImageBoot  bool
-    HasPrivateNetwork   bool
-    HasFirewall         bool
-    HasLoadBalancer     bool
-    HasVolumes          bool
-    HasCCM              bool
-    HasCSI              bool
-}
-
-// VM Lifecycle — required for all providers
-type VMLifecycler interface {
-    CreateVM(ctx context.Context, opts VMOptions) (*VM, error)
-    DeleteVM(ctx context.Context, id string) error
-    GetVM(ctx context.Context, id string) (*VM, error)
-    ListVMs(ctx context.Context, filters VMFilters) ([]VM, error)
-    WaitForVM(ctx context.Context, id string, desired VMStatus, timeout time.Duration) error
-}
-
-// Network — for providers with private networking
-type Networker interface {
-    CreateNetwork(ctx context.Context, opts NetworkOptions) (*Network, error)
-    DeleteNetwork(ctx context.Context, id string) error
-    AttachNetwork(ctx context.Context, vmID, networkID string) error
-    DetachNetwork(ctx context.Context, vmID, networkID string) error
-}
-
-// Rescue Mode — for providers that support rescue boot (Hetzner, Scaleway)
-type RescueBootable interface {
-    EnableRescueMode(ctx context.Context, vmID string) error
-    DisableRescueMode(ctx context.Context, vmID string) error
-}
-
-// Firewall
-type FirewallManager interface {
-    CreateFirewall(ctx context.Context, opts FirewallOptions) (*Firewall, error)
-    DeleteFirewall(ctx context.Context, id string) error
-    AttachFirewall(ctx context.Context, fwID, vmID string) error
-}
-
-// Load Balancer
-type LoadBalancerManager interface {
-    CreateLoadBalancer(ctx context.Context, opts LBOptions) (*LoadBalancer, error)
-    DeleteLoadBalancer(ctx context.Context, id string) error
-}
-
-// SSH Keys
-type SSHKeyManager interface {
-    UploadSSHKey(ctx context.Context, name, publicKey string) (*SSHKey, error)
-    DeleteSSHKey(ctx context.Context, id string) error
-    ListSSHKeys(ctx context.Context) ([]SSHKey, error)
-}
-
-// Volumes
-type VolumeManager interface {
-    CreateVolume(ctx context.Context, opts VolumeOptions) (*Volume, error)
-    AttachVolume(ctx context.Context, vmID, volumeID string) error
-    DeleteVolume(ctx context.Context, id string) error
-}
-```
-
-### Provider Registry
+The Gateway is the single entry point for all external traffic.
 
 ```go
-type Registry struct {
-    providers map[string]Provider
+package gateway
+
+type Gateway struct {
+    // Routing
+    router *Router
+    
+    // Agent management
+    agentManager *AgentManager
+    
+    // Channels
+    channels map[string]Channel
+    
+    // Events
+    eventBus EventBus
 }
 
-func (r *Registry) Register(name string, p Provider) { ... }
-func (r *Registry) Get(name string) (Provider, error) { ... }
-
-// Type assertions for capabilities
-func HasCapability[T any](p Provider) (T, bool) {
-    cap, ok := p.(T)
-    return cap, ok
-}
-
-// Usage:
-if rescuer, ok := providers.HasCapability[RescueBootable](provider); ok {
-    rescuer.EnableRescueMode(ctx, vmID)
-}
-```
-
----
-
-## 6. Cluster Engine Interface (Reconciler-Based)
-
-Instead of monolithic `Bootstrap()`, engines produce a **reconcile plan** of discrete steps.
-
-```go
-package clusters
-
-// Engine generates a reconciliation plan for a cluster type
-type Engine interface {
-    Name() string
-    Description() string
+func (g *Gateway) Route(ctx context.Context, msg IncomingMessage) error {
+    // 1. Determine target agent from binding rules
+    agentName := g.router.Resolve(msg.Channel, msg.Sender, msg.Content)
     
-    // Validation
-    ValidateSpec(spec ClusterSpec) error
-    
-    // Generate a reconcile plan from current state to desired state
-    Plan(ctx context.Context, cluster *Cluster, provider providers.Provider) ([]Step, error)
-    
-    // Health check
-    HealthCheck(ctx context.Context, cluster *Cluster) (HealthStatus, error)
-    
-    // Cleanup
-    Destroy(ctx context.Context, cluster *Cluster, provider providers.Provider) error
-}
-
-// Step is a discrete, retryable, compensatable unit of work
-type Step struct {
-    ID            string
-    Name          string
-    Type          StepType     // CreateVM, InstallOS, BootstrapEtcd, InstallAddon
-    DependsOn     []string     // step IDs that must complete first
-    
-    // Execution
-    Execute       func(ctx context.Context) error
-    
-    // Compensation (rollback on failure)
-    Compensate    func(ctx context.Context) error
-    
-    // Config
-    Timeout       time.Duration
-    MaxRetries    int
-    
-    // Result
-    Result        StepResult
-}
-
-type StepType string
-const (
-    StepCreateNetwork   StepType = "create_network"
-    StepCreateVM        StepType = "create_vm"
-    StepInstallOS       StepType = "install_os"
-    StepGenerateConfig  StepType = "generate_config"
-    StepBootstrapEtcd   StepType = "bootstrap_etcd"
-    StepJoinWorkers     StepType = "join_workers"
-    StepInstallAddon    StepType = "install_addon"
-    StepConfigureVPN    StepType = "configure_vpn"
-    StepValidate        StepType = "validate"
-)
-
-type StepResult struct {
-    Status    StepStatus  // Pending, Running, Completed, Failed, Compensated
-    Output    map[string]interface{}
-    Error     string
-    StartedAt *time.Time
-    EndedAt   *time.Time
-}
-```
-
-### Talos Engine Plan Example
-
-```go
-func (e *TalosEngine) Plan(ctx context.Context, cluster *Cluster, p providers.Provider) ([]Step, error) {
-    steps := []Step{}
-    
-    // Step 1: Ensure network exists
-    steps = append(steps, Step{
-        ID: "network",
-        Name: "Create VPC Network",
-        Type: StepCreateNetwork,
-        Execute: func(ctx context.Context) error { ... },
-        Compensate: func(ctx context.Context) error { 
-            return networker.DeleteNetwork(ctx, networkID) 
-        },
-    })
-    
-    // Step 2: Create control plane VMs
-    for i := 0; i < cluster.ControlPlanes; i++ {
-        steps = append(steps, Step{
-            ID: fmt.Sprintf("cp-%d", i),
-            Name: fmt.Sprintf("Create CP%d", i+1),
-            Type: StepCreateVM,
-            DependsOn: []string{"network"},
-            Execute: func(ctx context.Context) error { ... },
-            Compensate: func(ctx context.Context) error { 
-                return vmlc.DeleteVM(ctx, vmID) 
-            },
-        })
-    }
-    
-    // Step 3: Install OS (rescue mode for Talos)
-    for i := 0; i < cluster.ControlPlanes; i++ {
-        steps = append(steps, Step{
-            ID: fmt.Sprintf("cp-%d-os", i),
-            Name: fmt.Sprintf("Install Talos on CP%d", i+1),
-            Type: StepInstallOS,
-            DependsOn: []string{fmt.Sprintf("cp-%d", i)},
-            Execute: func(ctx context.Context) error { 
-                // Enable rescue, flash image, reboot
-                return e.installTalos(ctx, vmID, providerID) 
-            },
-            Compensate: func(ctx context.Context) error { 
-                // Delete and recreate VM
-                return nil 
-            },
-        })
-    }
-    
-    // Step 4: Generate and apply Talos config
-    steps = append(steps, Step{
-        ID: "talos-config",
-        Name: "Generate and Apply Talos Config",
-        Type: StepGenerateConfig,
-        DependsOn: []string{"cp-0-os", "cp-1-os"}, // all CPs installed
-        Execute: func(ctx context.Context) error { ... },
-    })
-    
-    // Step 5: Bootstrap etcd
-    steps = append(steps, Step{
-        ID: "etcd",
-        Name: "Bootstrap etcd",
-        Type: StepBootstrapEtcd,
-        DependsOn: []string{"talos-config"},
-        Execute: func(ctx context.Context) error { ... },
-    })
-    
-    // Step 6: Wait for K8s API
-    steps = append(steps, Step{
-        ID: "k8s-api",
-        Name: "Wait for Kubernetes API",
-        Type: StepValidate,
-        DependsOn: []string{"etcd"},
-        Execute: func(ctx context.Context) error { ... },
-    })
-    
-    // Step 7: Join workers
-    for i := 0; i < cluster.Workers; i++ {
-        steps = append(steps, Step{
-            ID: fmt.Sprintf("worker-%d", i),
-            Name: fmt.Sprintf("Create and Join Worker %d", i+1),
-            Type: StepJoinWorkers,
-            DependsOn: []string{"k8s-api"},
-            Execute: func(ctx context.Context) error { ... },
-        })
-    }
-    
-    // Step 8: Install CNI
-    steps = append(steps, Step{
-        ID: "cni",
-        Name: "Install CNI",
-        Type: StepInstallAddon,
-        DependsOn: []string{"k8s-api"},
-        Execute: func(ctx context.Context) error { 
-            return addonManager.Install(ctx, cluster, "cilium", config) 
-        },
-    })
-    
-    return steps, nil
-}
-```
-
----
-
-## 7. Addon Interface (With Dependencies)
-
-```go
-package addons
-
-type Installer interface {
-    Name() string
-    Description() string
-    
-    // Dependencies — addons that must be installed first
-    Dependencies() []string
-    
-    // Default config for this addon given provider + cluster
-    DefaultConfig(provider string, clusterType string) map[string]string
-    
-    // Validation
-    ValidateConfig(config map[string]string) error
-    
-    // Lifecycle
-    IsInstalled(ctx context.Context, cluster *Cluster) (bool, error)
-    Install(ctx context.Context, cluster *Cluster, config map[string]string) error
-    Upgrade(ctx context.Context, cluster *Cluster, config map[string]string) error
-    Uninstall(ctx context.Context, cluster *Cluster) error
-    
-    // Status
-    Status(ctx context.Context, cluster *Cluster) (AddonStatus, error)
-    
-    // Required secrets (Vault paths)
-    RequiredSecrets() []string
-}
-
-type AddonStatus struct {
-    Phase      AddonPhase  // Pending, Installing, Ready, Failed
-    Version    string
-    Message    string
-    Conditions map[string]bool
-}
-
-// Example: Cilium depends on nothing
-// Example: MetalLB depends on CNI
-// Example: Cloudflare Tunnel depends on Ingress + CertManager
-// Example: CertManager has no dependencies but is depended on by others
-```
-
----
-
-## 8. Task Engine (River over RabbitMQ)
-
-Instead of an in-process goroutine pool, use **durable task execution** that survives restarts.
-
-### Options Evaluated
-
-| Engine | Pros | Cons |
-|--------|------|------|
-| **Temporal** | Full saga, visibility UI, mature | Heavy, requires separate server |
-| **River** | Postgres-native, Go-native, lightweight | Younger project |
-| **Asynq** | Redis-based, simple | Redis not our backbone |
-| **Custom RabbitMQ** | Fits our backbone, flexible | More code to maintain |
-
-**Decision:** Use **River** (or **Asynq** if we add Redis later) for the task engine, with RabbitMQ as the event bus for pub/sub.
-
-### Task Types
-
-```go
-package tasks
-
-// Provisioning tasks
-
-const (
-    TypeCreateCluster    = "cluster:create"
-    TypeDeleteCluster    = "cluster:delete"
-    TypeInstallAddon     = "addon:install"
-    TypeExecuteStep      = "step:execute"
-    TypeCompensateStep   = "step:compensate"
-    TypeHealthCheck      = "cluster:health_check"
-    TypeAutoTeardown     = "cluster:auto_teardown"
-)
-
-// River job handler
-func (w *Worker) Work(ctx context.Context, job *river.Job[CreateClusterArgs]) error {
-    cluster, err := w.store.GetCluster(ctx, job.Args.ClusterID)
+    // 2. Get or activate agent
+    agent, err := g.agentManager.Get(ctx, agentName)
     if err != nil {
         return err
     }
     
-    // Generate plan
-    engine := w.engines.Get(cluster.ClusterType)
-    steps, err := engine.Plan(ctx, cluster, w.providers.Get(cluster.Provider))
-    
-    // Execute each step
-    for _, step := range steps {
-        if err := w.executeStep(ctx, cluster, step); err != nil {
-            // Trigger compensation
-            return w.compensate(ctx, cluster, steps, step)
-        }
+    // 3. Check permissions
+    if !agent.CanUseTool(msg.Intent) {
+        return fmt.Errorf("agent %s cannot perform %s", agentName, msg.Intent)
     }
     
-    return nil
+    // 4. Forward to agent
+    return g.agentManager.Dispatch(ctx, agent, msg)
 }
 ```
 
-### Event Bus (RabbitMQ)
+**Routing logic:**
+- Telegram bot messages → bound agent
+- Discord mentions → bound agent
+- Cron triggers → scheduled agent
+- Manual API calls → specified agent
+
+### 5.2 Agent Manager
 
 ```go
-package events
+package agents
 
-type Bus interface {
-    Publish(ctx context.Context, event Event) error
-    Subscribe(queue string, handler EventHandler) error
+type Manager struct {
+    store       AgentStore
+    supervisor  Supervisor
+    registry    *Registry
 }
 
-type Event struct {
-    Type      string      // "cluster.created", "step.completed", "step.failed"
-    ClusterID string
-    Timestamp time.Time
-    Payload   map[string]interface{}
+func (m *Manager) Start(ctx context.Context, agentID string) error {
+    agent, err := m.store.Get(ctx, agentID)
+    if err != nil {
+        return err
+    }
+    
+    // 1. Ensure workspace exists
+    if err := m.ensureWorkspace(agent); err != nil {
+        return err
+    }
+    
+    // 2. Write config files
+    if err := m.writeConfig(agent); err != nil {
+        return err
+    }
+    
+    // 3. Start process (Docker / systemd / binary)
+    proc, err := m.supervisor.Start(agent)
+    if err != nil {
+        return err
+    }
+    
+    // 4. Update state
+    agent.Status = "active"
+    agent.PID = proc.PID
+    return m.store.Update(ctx, agent)
 }
 
-// Event types:
-// - cluster.provisioning.started
-// - cluster.step.started
-// - cluster.step.completed
-// - cluster.step.failed
-// - cluster.step.compensated
-// - cluster.ready
-// - cluster.failed
-// - cluster.deleting
-// - cluster.deleted
-// - addon.installing
-// - addon.ready
+func (m *Manager) Stop(ctx context.Context, agentID string) error {
+    // Graceful shutdown with timeout
+}
+
+func (m *Manager) Restart(ctx context.Context, agentID string) error {
+    // Stop + Start
+}
+
+func (m *Manager) HealthCheck(ctx context.Context, agentID string) (HealthStatus, error) {
+    // Ping agent heartbeat endpoint
+    // Check process alive
+    // Verify last run within threshold
+}
+```
+
+### 5.3 Supervisor (Process Management)
+
+```go
+package supervisor
+
+// Supports multiple backends
+type Backend interface {
+    Start(agent *Agent) (*Process, error)
+    Stop(pid int) error
+    Status(pid int) (ProcessStatus, error)
+    Logs(pid int, lines int) ([]string, error)
+}
+
+// Implementations:
+// - DockerBackend (docker run / compose)
+// - SystemdBackend (systemctl start/stop)
+// - KubernetesBackend (Deployment/StatefulSet)
+// - NomadBackend (job dispatch)
+// - LocalBackend (os/exec)
+```
+
+**Docker Compose example:**
+```yaml
+# docker-compose.yml for agent fleet
+version: '3.8'
+
+services:
+  gateway:
+    image: openclaw/gateway:latest
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: postgres
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      VAULT_ADDR: http://vault:8200
+
+  ops-agent:
+    image: openclaw/agent:latest
+    volumes:
+      - ./agents/ops:/workspace
+    environment:
+      AGENT_NAME: ops-agent
+      GATEWAY_URL: http://gateway:8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mail-agent:
+    image: openclaw/agent:latest
+    volumes:
+      - ./agents/mail:/workspace
+    environment:
+      AGENT_NAME: mail-agent
+      ALLOWED_TOOLS: "web_search,message,read"
+      DENIED_TOOLS: "exec,gateway"
+    restart: unless-stopped
+```
+
+### 5.4 Approval Service
+
+```go
+package approvals
+
+type Service struct {
+    store ApprovalStore
+    notifier Notifier
+}
+
+func (s *Service) RequestApproval(ctx context.Context, req ApprovalRequest) (*Approval, error) {
+    // 1. Create approval record
+    approval := &Approval{
+        RunID: req.RunID,
+        AgentID: req.AgentID,
+        ActionType: req.ActionType,
+        ActionDetails: req.Details,
+        Status: "pending",
+        ExpiresAt: time.Now().Add(1 * time.Hour),
+    }
+    
+    if err := s.store.Create(ctx, approval); err != nil {
+        return nil, err
+    }
+    
+    // 2. Notify human reviewers
+    s.notifier.Send(ctx, Notification{
+        Channel: "slack",
+        Target: "#ops-approvals",
+        Message: fmt.Sprintf("Agent %s requests approval to %s: %s", 
+            req.AgentName, req.ActionType, req.Details),
+        Actions: []Action{
+            {Label: "Approve", URL: fmt.Sprintf("/approvals/%s/approve", approval.ID)},
+            {Label: "Reject", URL: fmt.Sprintf("/approvals/%s/reject", approval.ID)},
+        },
+    })
+    
+    return approval, nil
+}
+
+func (s *Service) Approve(ctx context.Context, approvalID string, approvedBy string) error {
+    approval, err := s.store.Get(ctx, approvalID)
+    if err != nil {
+        return err
+    }
+    
+    approval.Status = "approved"
+    approval.ApprovedBy = approvedBy
+    approval.ApprovedAt = time.Now()
+    
+    // Notify agent to proceed
+    s.eventBus.Publish(ctx, Event{
+        Type: "approval.granted",
+        ApprovalID: approvalID,
+    })
+    
+    return s.store.Update(ctx, approval)
+}
+```
+
+### 5.5 Observability Service
+
+```go
+package observability
+
+// Metrics collected per run:
+type RunMetrics struct {
+    AgentID          string
+    Model            string
+    DurationMs       int
+    PromptTokens     int
+    CompletionTokens int
+    CostUSD          float64
+    ToolsCalled      []ToolCall
+    Status           string
+    Error            string
+}
+
+// Dashboard queries:
+// - Active agents
+// - Runs per agent (last 24h)
+// - Error rate per agent
+// - Cost per agent
+// - Pending approvals
+// - Agents needing restart
+```
+
+---
+
+## 6. Agent Lifecycle
+
+```
+[Inactive]
+   │
+   │ POST /agents/:id/start
+   ▼
+[Starting] ──► [Error] (if start fails)
+   │
+   ▼
+[Active] ◄──────┐
+   │             │
+   │ Heartbeat   │
+   │ timeout     │
+   ▼             │
+[Unhealthy]     │
+   │             │
+   │ Auto-restart│
+   └─────────────┘
+   │
+   │ POST /agents/:id/stop
+   ▼
+[Stopping]
+   │
+   ▼
+[Inactive]
+```
+
+---
+
+## 7. Permission Model
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Agent Permission                      │
+├─────────────────────────────────────────────────────────┤
+│  Tool         │ ops-agent │ mail-agent │ calendar-agent │
+├───────────────┼───────────┼────────────┼────────────────┤
+│  web_search   │    ✅     │     ✅     │      ✅       │
+│  message      │    ✅     │     ✅     │      ❌       │
+│  read         │    ✅     │     ✅     │      ✅       │
+│  exec         │    ✅     │     ❌     │      ❌       │
+│  gateway      │    ✅     │     ❌     │      ❌       │
+│  cron         │    ✅     │     ✅     │      ✅       │
+│  nodes        │    ✅     │     ❌     │      ❌       │
+│  image        │    ✅     │     ✅     │      ❌       │
+└───────────────┴───────────┴────────────┴────────────────┘
+```
+
+**Permission rules:**
+- Default: deny all
+- Explicit allow list per agent
+- Explicit deny list overrides allow list
+- Dangerous tools require approval gate
+
+---
+
+## 8. Configuration as Code
+
+```
+config/
+├── agents/
+│   ├── ops-agent/
+│   │   ├── agent.json          # Agent definition
+│   │   ├── SOUL.md             # Personality
+│   │   ├── TOOLS.md            # Tool permissions
+│   │   └── bindings.yaml       # Channel routing
+│   ├── mail-agent/
+│   │   ├── agent.json
+│   │   └── ...
+│   └── calendar-agent/
+│       └── ...
+├── prompts/
+│   ├── system-prompts/
+│   └── task-prompts/
+├── global/
+│   ├── openclaw.json           # Gateway config
+│   ├── models.yaml             # Model aliases and limits
+│   └── policies.yaml           # Global approval policies
+└── environments/
+    ├── dev/
+    ├── staging/
+    └── prod/
+```
+
+**Git sync workflow:**
+```bash
+# 1. Engineer edits agent config
+vim config/agents/ops-agent/TOOLS.md
+
+# 2. Commit and push
+git add . && git commit -m "ops-agent: add nodes tool"
+git push origin main
+
+# 3. Platform detects change (webhook / poll)
+# 4. Platform validates config
+# 5. Platform rolls out to affected agents (rolling restart)
 ```
 
 ---
 
 ## 9. API Design
 
-### 9.1 REST API (v1)
+### 9.1 Agents
 
 ```
-POST   /v1/clusters              → Create cluster (202 Accepted, returns operation ID)
-GET    /v1/clusters              → List clusters
-GET    /v1/clusters/:id          → Get cluster status
-PATCH  /v1/clusters/:id          → Update cluster (scale, addons)
-DELETE /v1/clusters/:id          → Delete cluster (202 Accepted)
-POST   /v1/clusters/:id/cancel   → Cancel ongoing operation
-POST   /v1/clusters/:id/retry    → Retry failed operation
+GET    /v1/agents              → List agents
+POST   /v1/agents              → Create agent
+GET    /v1/agents/:id          → Get agent status
+PATCH  /v1/agents/:id          → Update agent config
+DELETE /v1/agents/:id          → Delete agent
 
-GET    /v1/clusters/:id/events      → SSE stream of provisioning events
-GET    /v1/clusters/:id/nodes       → List nodes
-GET    /v1/clusters/:id/resources   → List cloud resources
-GET    /v1/clusters/:id/addons      → List addons
-POST   /v1/clusters/:id/addons      → Install addon
-DELETE /v1/clusters/:id/addons/:name → Uninstall addon
-
-GET    /v1/clusters/:id/kubeconfig  → Download kubeconfig ( Vault-secured )
-
-GET    /v1/providers             → List providers
-GET    /v1/providers/:name/capabilities → Provider capabilities
-GET    /v1/cluster-types         → List cluster types
-GET    /v1/addons                → List available addons
+POST   /v1/agents/:id/start    → Start agent
+POST   /v1/agents/:id/stop     → Stop agent
+POST   /v1/agents/:id/restart  → Restart agent
+GET    /v1/agents/:id/logs     → Get agent logs
+GET    /v1/agents/:id/runs     → Get run history
 ```
 
-### 9.2 Idempotency
+### 9.2 Runs & Audit
 
-All mutating endpoints accept an `Idempotency-Key: <uuid>` header. The service stores `(key, response, expiration)` in Redis for 24h.
-
-```go
-func (s *Server) CreateCluster(w http.ResponseWriter, r *http.Request) {
-    key := r.Header.Get("Idempotency-Key")
-    if key != "" {
-        if resp, ok := s.idempotencyStore.Get(key); ok {
-            writeJSON(w, resp.StatusCode, resp.Body)
-            return
-        }
-    }
-    
-    // Process request
-    cluster, err := s.service.CreateCluster(r.Context(), req)
-    
-    if key != "" {
-        s.idempotencyStore.Set(key, resp, 24*time.Hour)
-    }
-}
+```
+GET    /v1/runs                → List runs (filter by agent, status, date)
+GET    /v1/runs/:id            → Get run details
+GET    /v1/runs/:id/tools      → Get tool calls for run
 ```
 
----
+### 9.3 Approvals
 
-## 10. Secret Management (HashiCorp Vault)
+```
+GET    /v1/approvals           → List pending approvals
+GET    /v1/approvals/:id       → Get approval details
+POST   /v1/approvals/:id/approve → Approve action
+POST   /v1/approvals/:id/reject  → Reject action
+```
 
-**Nothing sensitive in PostgreSQL.**
+### 9.4 Channels
 
-| Secret | Vault Path | Access |
-|--------|-----------|--------|
-| Cloud API tokens | `providers/hetzner/token` | Service account |
-| Cloud API tokens | `providers/scaleway/credentials` | Service account |
-| SSH private keys | `clusters/:id/ssh-keys/:name` | Service account |
-| Kubeconfig | `clusters/:id/kubeconfig` | Service account + cluster owner |
-| Netbird setup key | `vpn/netbird/setup-key` | Service account |
-| Cloudflare token | `dns/cloudflare/token` | Service account |
-| Let's Encrypt | `certs/letsencrypt/account` | Service account |
+```
+GET    /v1/channels            → List channels
+POST   /v1/channels            → Create channel binding
+PATCH  /v1/channels/:id        → Update binding
+DELETE /v1/channels/:id        → Remove binding
+```
 
-```go
-type SecretStore interface {
-    Get(ctx context.Context, path string) (string, error)
-    Put(ctx context.Context, path string, value string) error
-    Delete(ctx context.Context, path string) error
-    GetKubeconfig(ctx context.Context, clusterID string) ([]byte, error)
-}
+### 9.5 Dashboard
+
+```
+GET    /v1/dashboard           → Overview metrics
+GET    /v1/dashboard/agents    → Agent health summary
+GET    /v1/dashboard/costs     → Cost breakdown
+GET    /v1/dashboard/events    → Recent events stream
 ```
 
 ---
 
-## 11. Configuration
+## 10. Event Types (RabbitMQ)
+
+```
+agent.created
+agent.started
+agent.stopped
+agent.restarted
+agent.error
+agent.heartbeat
+
+run.started
+run.completed
+run.failed
+run.approval_requested
+run.approval_granted
+run.approval_rejected
+
+tool.called
+tool.approved
+tool.denied
+
+config.changed
+config.synced
+config.failed
+```
+
+---
+
+## 11. Docker Compose (Local Dev)
 
 ```yaml
-# config.yaml
-server:
-  http_port: 8080
-  grpc_port: 9090
-  idempotency_ttl: 24h
-
-database:
-  type: postgres
-  host: ${DB_HOST}
-  port: 5432
-  database: cluster_provisioner
-  user: ${DB_USER}
-  password: ${DB_PASSWORD}
-  ssl_mode: require
-  pool_size: 20
-
-messaging:
-  type: rabbitmq
-  url: ${RABBITMQ_URL}
-  exchange: cluster-provisioner.events
-  queues:
-    - cluster-events
-    - task-retries
-    - dead-letter
-
-secrets:
-  type: vault
-  address: ${VAULT_ADDR}
-  token: ${VAULT_TOKEN}
-  mount_path: secret
-
-providers:
-  hetzner:
-    token_path: providers/hetzner/token
-  scaleway:
-    credentials_path: providers/scaleway/credentials
-  vultr:
-    api_key_path: providers/vultr/api-key
-
-task_engine:
-  type: river
-  max_workers: 10
-  poll_interval: 5s
-  
-  queues:
-    - name: provisioning
-      priority: 1
-      max_concurrent: 5
-    - name: health_checks
-      priority: 2
-      max_concurrent: 10
-
-addons:
-  cilium:
-    default_version: v1.19.3
-  metallb:
-    enabled: true
-  envoy_gateway:
-    default_version: v1.1.0
-  cert_manager:
-    default_version: v1.14.0
-
-provisioning:
-  default_ttl: 24h
-  max_ttl: 168h
-  auto_teardown: true
-  phase_timeout: 30m
-  max_retries: 3
-  retry_backoff: exponential
-
-observability:
-  metrics_port: 9091
-  log_level: info
-  tracing:
-    enabled: true
-    exporter: otlp
-```
-
----
-
-## 12. Directory Structure
-
-```
-cluster-provisioner/
-├── cmd/
-│   ├── server/
-│   │   └── main.go              # HTTP/gRPC server
-│   └── worker/
-│       └── main.go              # Background task worker
-├── pkg/
-│   ├── api/
-│   │   ├── http/                # REST handlers, middleware
-│   │   └── grpc/                # gRPC service definitions
-│   ├── providers/
-│   │   ├── interface.go         # Capability interfaces
-│   │   ├── registry.go
-│   │   ├── hetzner/
-│   │   │   ├── client.go        # Hetzner SDK wrapper
-│   │   │   ├── vm.go            # VMLifecycler impl
-│   │   │   ├── network.go       # Networker impl
-│   │   │   └── rescue.go        # RescueBootable impl
-│   │   ├── scaleway/
-│   │   │   ├── client.go
-│   │   │   ├── vm.go
-│   │   │   ├── network.go
-│   │   │   └── rescue.go
-│   │   └── vultr/
-│   │       ├── client.go
-│   │       ├── vm.go
-│   │       └── network.go
-│   ├── clusters/
-│   │   ├── interface.go         # Engine interface
-│   │   ├── registry.go
-│   │   ├── talos/
-│   │   │   ├── engine.go        # TalosEngine
-│   │   │   ├── plan.go          # Plan generator
-│   │   │   ├── install.go       # Rescue mode image flashing
-│   │   │   └── config.go        # talosctl config generation
-│   │   ├── k3s/
-│   │   └── rke2/
-│   ├── addons/
-│   │   ├── interface.go         # Installer interface
-│   │   ├── registry.go
-│   │   ├── cilium/
-│   │   ├── metallb/
-│   │   ├── envoygateway/
-│   │   ├── certmanager/
-│   │   ├── cloudflaretunnel/
-│   │   └── netbird/
-│   ├── store/
-│   │   ├── interface.go         # Database interface
-│   │   └── postgres/            # PostgreSQL implementation
-│   ├── tasks/
-│   │   ├── interface.go         # Task engine interface
-│   │   └── river/               # River implementation
-│   ├── events/
-│   │   ├── interface.go         # Event bus interface
-│   │   └── rabbitmq/            # RabbitMQ implementation
-│   ├── secrets/
-│   │   ├── interface.go         # Secret store interface
-│   │   └── vault/               # HashiCorp Vault implementation
-│   ├── reconciler/
-│   │   ├── interface.go
-│   │   └── worker.go            # Declarative reconciler
-│   └── config/
-│       └── config.go
-├── internal/
-│   ├── talosctl/                # Talosctl Go client
-│   ├── helm/                    # Helm Go SDK wrapper
-│   └── kubectl/                 # K8s Go client
-├── migrations/                  # PostgreSQL migrations (golang-migrate)
-├── configs/
-│   └── config.yaml
-├── docker/
-│   ├── Dockerfile.server
-│   ├── Dockerfile.worker
-│   └── docker-compose.yml       # Local dev: PG + RabbitMQ + Vault
-├── Makefile
-└── README.md
-```
-
----
-
-## 13. Docker Compose (Local Dev)
-
-```yaml
-# docker-compose.yml
 version: '3.8'
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: provisioner
-      POSTGRES_PASSWORD: provisioner
-      POSTGRES_DB: cluster_provisioner
+      POSTGRES_USER: openclaw
+      POSTGRES_PASSWORD: openclaw
+      POSTGRES_DB: openclaw_platform
     ports:
       - "5432:5432"
     volumes:
@@ -901,8 +715,6 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
 
   vault:
     image: hashicorp/vault:latest
@@ -913,16 +725,14 @@ services:
     ports:
       - "8200:8200"
 
-  server:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.server
+  platform:
+    build: .
     ports:
       - "8080:8080"
     environment:
       DB_HOST: postgres
-      DB_USER: provisioner
-      DB_PASSWORD: provisioner
+      DB_USER: openclaw
+      DB_PASSWORD: openclaw
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: dev-token
@@ -931,106 +741,151 @@ services:
       - rabbitmq
       - vault
 
-  worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
+  ops-agent:
+    image: openclaw/agent:latest
     environment:
-      DB_HOST: postgres
-      DB_USER: provisioner
-      DB_PASSWORD: provisioner
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      VAULT_ADDR: http://vault:8200
-      VAULT_TOKEN: dev-token
+      AGENT_NAME: ops-agent
+      GATEWAY_URL: http://platform:8080
+      ALLOWED_TOOLS: "web_search,message,read,exec,gateway,cron,nodes,image"
+    volumes:
+      - ./agents/ops:/workspace
+    restart: unless-stopped
     depends_on:
-      - postgres
-      - rabbitmq
-      - vault
+      - platform
+
+  mail-agent:
+    image: openclaw/agent:latest
+    environment:
+      AGENT_NAME: mail-agent
+      GATEWAY_URL: http://platform:8080
+      ALLOWED_TOOLS: "web_search,message,read,cron"
+      DENIED_TOOLS: "exec,gateway"
+    volumes:
+      - ./agents/mail:/workspace
+    restart: unless-stopped
+    depends_on:
+      - platform
 
 volumes:
   postgres_data:
-  rabbitmq_data:
 ```
 
 ---
 
-## 14. MVP Scope
+## 12. MVP Scope
 
-**Phase 1: Core Infrastructure**
+**Phase 1: Core Platform**
 - [ ] PostgreSQL schema + migrations
-- [ ] RabbitMQ event bus
-- [ ] HashiCorp Vault integration
-- [ ] River task engine
-- [ ] REST API framework
+- [ ] Agent CRUD API
+- [ ] Process supervisor (Docker backend)
+- [ ] Agent start/stop/restart
+- [ ] Basic health checks
 
-**Phase 2: Providers**
-- [ ] Capability-based provider interface
-- [ ] Hetzner provider (extract from poc-hetzner)
-- [ ] Scaleway provider (extract from poc-hetzner)
-- [ ] Provider registry
+**Phase 2: Gateway & Routing**
+- [ ] Message routing to agents
+- [ ] Channel bindings (Telegram, Discord)
+- [ ] Agent registry
 
-**Phase 3: Cluster Engine**
-- [ ] Declarative reconciler
-- [ ] Talos engine with step plan
-- [ ] Step execution + compensation
-- [ ] State machine persistence
+**Phase 3: Permissions & Approvals**
+- [ ] Tool allow/deny lists
+- [ ] Approval gate service
+- [ ] Slack/email notifications for approvals
 
-**Phase 4: Addons**
-- [ ] Addon interface with dependencies
-- [ ] Cilium installer (Go SDK, not shell)
-- [ ] MetalLB installer
-- [ ] Addon registry
+**Phase 4: Observability**
+- [ ] Run audit logging
+- [ ] Event bus (RabbitMQ)
+- [ ] Dashboard with agent status
 
-**Phase 5: Operations**
-- [ ] Health checks
-- [ ] Auto-teardown (cron job)
-- [ ] Events + SSE streaming
-- [ ] Kubeconfig endpoint (Vault-secured)
+**Phase 5: GitOps**
+- [ ] Config as code
+- [ ] Git webhook sync
+- [ ] Rolling config updates
 
 **Phase 6: Production**
-- [ ] gRPC API
-- [ ] Prometheus metrics
-- [ ] Distributed tracing (OpenTelemetry)
-- [ ] Web UI (minimal)
+- [ ] Multi-replica support
+- [ ] Kubernetes backend
+- [ ] Cost tracking
+- [ ] Advanced analytics
 
 ---
 
-## 15. Migration from poc-hetzner
+## 13. Directory Structure
 
-| Component | poc-hetzner | cluster-provisioner |
-|-----------|-------------|---------------------|
-| CLI tool | `talos-poc` binary | REST/gRPC API + Go SDK |
-| Provider code | `providers/scaleway/client.go` | `pkg/providers/scaleway/` (capability-based) |
-| Talos logic | `cmd_scaleway.go` (monolithic) | `pkg/clusters/talos/` (reconciler + steps) |
-| Addon logic | `cmd_install_addons.go` | `pkg/addons/<name>/` (interface + dependencies) |
-| State | `keys/state.json` (file) | PostgreSQL + migrations |
-| Events | None | RabbitMQ pub/sub |
-| Secrets | Env vars + files | HashiCorp Vault |
-| Execution | In-process goroutines | River durable tasks |
-| Kubeconfig | Local files | Vault-secured, API-served |
+```
+openclaw-platform/
+├── cmd/
+│   ├── server/
+│   │   └── main.go              # API server
+│   └── worker/
+│       └── main.go              # Background worker
+├── pkg/
+│   ├── api/
+│   │   ├── http/                # REST handlers
+│   │   └── middleware/          # Auth, logging
+│   ├── agents/
+│   │   ├── manager.go           # Agent lifecycle
+│   │   ├── registry.go          # Agent registry
+│   │   └── supervisor/
+│   │       ├── interface.go
+│   │       ├── docker.go
+│   │       ├── systemd.go
+│   │       └── kubernetes.go
+│   ├── gateway/
+│   │   ├── router.go            # Message routing
+│   │   └── dispatcher.go        # Agent dispatch
+│   ├── permissions/
+│   │   ├── checker.go           # Tool permission checks
+│   │   └── policies.go          # Default policies
+│   ├── approvals/
+│   │   ├── service.go
+│   │   └── notifier.go
+│   ├── observability/
+│   │   ├── metrics.go
+│   │   ├── audit.go
+│   │   └── dashboard.go
+│   ├── events/
+│   │   ├── interface.go
+│   │   └── rabbitmq/
+│   ├── store/
+│   │   ├── interface.go
+│   │   └── postgres/
+│   ├── secrets/
+│   │   ├── interface.go
+│   │   └── vault/
+│   └── config/
+│       └── sync.go              # Git config sync
+├── migrations/
+├── configs/
+│   └── example/
+│       ├── agents/
+│       ├── prompts/
+│       └── policies.yaml
+├── docker/
+│   ├── Dockerfile
+│   └── docker-compose.yml
+├── Makefile
+└── README.md
+```
 
 ---
 
-## 16. Open Questions / Decisions
+## 14. Open Questions
 
 | # | Question | Status |
 |---|----------|--------|
-| 1 | Use River or Temporal for task engine? | **River** (lighter, Postgres-native) |
-| 2 | Auth/AuthZ: API keys or OAuth? | TBD — start with API keys |
-| 3 | Multi-tenancy: org isolation in DB? | TBD — start with single-tenant |
-| 4 | Cost tracking: provider billing APIs? | Post-MVP |
-| 5 | GitOps: trigger from Git push? | Post-MVP |
-| 6 | Node pools: heterogenous workers? | Post-MVP |
-| 7 | Auto-scaling: based on metrics? | Post-MVP |
-| 8 | Web UI framework? | TBD — likely React + TypeScript |
+| 1 | Auth model: API keys, OAuth, or SSO? | TBD — start with API keys |
+| 2 | Multi-tenancy: org/workspace isolation? | TBD — single-tenant first |
+| 3 | Cost model: per-agent, per-run, or flat? | Post-MVP |
+| 4 | Custom agent images or shared base? | Shared base + volume mounts |
+| 5 | Upgrade strategy: rolling or blue/green? | Rolling restart |
 
 ---
 
 ## References
 
-- `poc-hetzner` source: `/home/leadinnovation/Develop/poc-hetzner/`
-- Private intranet architecture: `docs/private-intranet-architecture.md`
+- OpenClaw docs: https://docs.openclaw.ai
+- OpenClaw GitHub: https://github.com/openclaw/openclaw
+- OpenClaw config: `/home/leadinnovation/.openclaw/workspace/`
+- OpenClaw Gateway: `gateway` tool actions
 - River task engine: https://riverqueue.com/
-- Temporal workflows: https://temporal.io/
-- Cluster API: https://cluster-api.sigs.k8s.io/
 - HashiCorp Vault: https://www.vaultproject.io/
