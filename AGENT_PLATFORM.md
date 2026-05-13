@@ -615,3 +615,341 @@ billing:
 - [ ] Multi-replica
 - [ ] K8s backend
 - [ ] Cost tracking
+
+---
+
+## 14. Maintenance & Security
+
+### 14.1 Container Image Updates (Security Patches)
+
+**Automated Image Builds:**
+
+```yaml
+# .github/workflows/agent-image-build.yaml
+name: Build Agent Images
+
+on:
+  push:
+    branches: [main]
+    paths: ['agents/**', 'Dockerfile']
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly security rebuild
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Scan base image for vulnerabilities
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'openclaw/agent:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      # Rebuild with latest security patches
+      - name: Build and push
+        run: |
+          docker build --pull -t openclaw/agent:${{ github.sha }} .
+          docker tag openclaw/agent:${{ github.sha }} openclaw/agent:latest
+          docker push openclaw/agent:latest
+```
+
+**Rolling Update Strategy:**
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # Start 1 new pod first
+      maxUnavailable: 0    # Never drop below desired replicas
+```
+
+**Process:**
+1. New image pushed with security patches
+2. Kubernetes does rolling update: new pod up → old pod down
+3. Agent state persisted in PVC (survives restart)
+4. Zero downtime
+
+### 14.2 OpenClaw Software Updates
+
+**Semantic Versioning + Channels:**
+
+```yaml
+apiVersion: openclaw.io/v1
+kind: Agent
+metadata:
+  name: ops-agent
+spec:
+  version: "1.2.3"      # Pin version for stability
+  updateChannel: "stable"  # stable, beta, canary
+```
+
+**Update Channels:**
+
+| Channel | Update Frequency | Risk | Use Case |
+|---------|-----------------|------|----------|
+| **stable** | Monthly | Low | Production agents |
+| **beta** | Weekly | Medium | Staging/testing |
+| **canary** | Daily | High | Ops-agent only |
+
+**Automated Updates via Controller:**
+
+```go
+// Controller checks for updates
+func (r *AgentReconciler) checkForUpdates(ctx context.Context, agent *openclawv1.Agent) error {
+    latestVersion := r.versionChecker.GetLatest(agent.Spec.UpdateChannel)
+    
+    if latestVersion != agent.Status.CurrentVersion {
+        agent.Spec.Image = fmt.Sprintf("openclaw/agent:%s", latestVersion)
+        
+        r.eventRecorder.Eventf(agent, corev1.EventTypeNormal, "Update",
+            "Updating from %s to %s", agent.Status.CurrentVersion, latestVersion)
+        
+        return r.Update(ctx, agent)
+    }
+    return nil
+}
+```
+
+### 14.3 Configuration Updates (No Restart Needed)
+
+```bash
+# Update ConfigMap
+kubectl edit configmap ops-agent-config -n openclaw
+
+# Signal agent to reload (no restart)
+kubectl exec -n openclaw deploy/ops-agent -- curl -X POST localhost:8080/reload
+```
+
+**Hot reload vs restart:**
+- ConfigMap changes → hot reload (0 downtime)
+- Image changes → rolling restart
+- CRD changes → controller reconciles
+
+### 14.4 Secret Rotation
+
+**API Key Rotation:**
+
+```yaml
+# External Secrets Operator
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: openai-api-key
+  namespace: openclaw
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-backend
+  target:
+    name: openai-api-key
+  data:
+    - secretKey: api-key
+      remoteRef:
+        key: providers/openai
+        property: api-key
+```
+
+**Rotation workflow:**
+1. Update secret in Vault
+2. External Secrets Operator detects change
+3. Kubernetes Secret updated
+4. Agent reads new secret on next API call
+5. No restart needed
+
+### 14.5 Maintenance Windows
+
+**Automated Maintenance Schedule:**
+
+```yaml
+apiVersion: openclaw.io/v1
+kind: MaintenanceWindow
+metadata:
+  name: weekly-patches
+spec:
+  schedule: "0 3 * * 0"  # Sunday 3 AM
+  duration: 2h
+  agents:
+    - mail-agent
+    - calendar-agent
+  exclude:
+    - ops-agent  # Never restart ops-agent automatically
+  actions:
+    - imageUpdate
+    - configSync
+    - workspaceCleanup
+```
+
+**Pre-Maintenance Checklist:**
+
+```bash
+# 1. Backup all agent workspaces
+kubectl exec -n openclaw deploy/ops-agent -- tar czf /backup/workspace-$(date +%s).tar.gz /workspace/
+
+# 2. Check for pending approvals
+curl http://gateway.openclaw.svc.cluster.local:8080/v1/approvals?status=pending
+
+# 3. Drain queue
+kubectl scale agent mail-agent --replicas=0  # Stop accepting new work
+sleep 60  # Wait for in-flight to complete
+
+# 4. Apply updates
+kubectl rollout restart deployment/mail-agent -n openclaw
+
+# 5. Verify health
+kubectl rollout status deployment/mail-agent -n openclaw
+curl http://mail-agent.openclaw.svc.cluster.local:8080/health
+
+# 6. Restore traffic
+kubectl scale agent mail-agent --replicas=1
+```
+
+### 14.6 Self-Healing
+
+**Automatic Restart on Failure:**
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3  # Restart after 3 failures
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+```
+
+**Circuit Breaker for External APIs:**
+
+```go
+// If OpenAI API is failing, switch to fallback model
+func (a *Agent) CallModel(ctx context.Context, prompt string) (string, error) {
+    resp, err := a.primaryModel.Call(ctx, prompt)
+    if err != nil {
+        if a.failureCount > 3 {
+            log.Warn("Primary model failing, switching to fallback")
+            return a.fallbackModel.Call(ctx, prompt)
+        }
+        a.failureCount++
+        return "", err
+    }
+    a.failureCount = 0
+    return resp, nil
+}
+```
+
+### 14.7 Security Hardening
+
+**Distroless Images:**
+
+```dockerfile
+# Dockerfile
+FROM golang:1.22 AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o agent ./cmd/agent
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /app/agent /agent
+COPY --from=builder /app/config /config
+USER 65532:65532  # Non-root
+ENTRYPOINT ["/agent"]
+```
+
+**Read-Only Root Filesystem:**
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+```
+
+**Network Policies:**
+
+```yaml
+# Block all egress except HTTPS and internal services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: openclaw
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+### 14.8 Monitoring Maintenance Health
+
+**Prometheus Alerts:**
+
+```yaml
+# prometheus-rules.yaml
+groups:
+  - name: agent-maintenance
+    rules:
+      - alert: AgentImageOutdated
+        expr: openclaw_agent_image_age_hours > 168  # 7 days
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} image is outdated"
+
+      - alert: AgentUpdateFailed
+        expr: increase(openclaw_agent_update_failures[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.agent }} update failed"
+
+      - alert: HighVulnerabilityCount
+        expr: openclaw_agent_vulnerabilities > 5
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent image has {{ $value }} vulnerabilities"
+```
+
+### 14.9 Maintenance Best Practices
+
+| Task | Method | Downtime |
+|------|--------|----------|
+| Security patches | Rolling update | Zero |
+| Config changes | Hot reload | Zero |
+| Secret rotation | Vault + External Secrets | Zero |
+| Major version | Canary deployment | Minimal |
+| Workspace cleanup | CronJob | Zero |
+| Emergency restart | kubectl rollout restart | ~30s |
+
+**Golden rule:** Treat agents like cattle, not pets. Kubernetes handles the rest.
