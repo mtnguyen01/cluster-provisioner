@@ -368,7 +368,224 @@ services:
 
 ---
 
-## 12. MVP Scope
+## 12. Cost Management & Model Routing
+
+### 12.1 Philosophy: Test on Subscription, Scale on API
+
+As the first customer, start with **subscription-based access** to validate the platform. Once proven, switch to **API-based billing** for cost control at scale.
+
+### 12.2 Model Tiers
+
+| Tier | Type | Models | Cost | Use Case |
+|------|------|--------|------|----------|
+| **Free** | Subscription | GPT-3.5, Claude Haiku | $0 | Dev testing, simple agents |
+| **Plus** | Subscription | GPT-4o, Claude Sonnet | $20/mo/user | Prototyping, low-volume agents |
+| **Pro** | Subscription | GPT-4o, Claude Opus | $200/mo/user | Power users, complex reasoning |
+| **API** | Pay-per-token | All models | Usage-based | Production, multi-tenant |
+| **Enterprise** | Committed | All + custom | Contract | Scale, SLA guarantees |
+
+### 12.3 Switching Strategy
+
+```
+Phase 1 (Now):      Subscription (Plus/Pro)
+                        ↓ validate platform works
+Phase 2 (3-6 mo):    Hybrid (subscription + API fallback)
+                        ↓ measure actual usage
+Phase 3 (6-12 mo):   API-only with optimization
+                        ↓ scale cost-effectively
+Phase 4 (12+ mo):    Enterprise/committed use
+```
+
+### 12.4 Cost Optimization Layer
+
+```go
+package models
+
+type CostManager struct {
+    // Per-agent budget tracking
+    agentBudgets map[string]*Budget
+    
+    // Model routing rules
+    router *ModelRouter
+    
+    // Caching layer
+    cache *PromptCache
+}
+
+type Budget struct {
+    AgentID      string
+    MonthlyLimit float64      // USD
+    CurrentSpend float64
+    AlertThreshold float64    // 80% of limit
+    
+    // Tier settings
+    DefaultTier  ModelTier    // Free, Plus, Pro, API
+    FallbackTier ModelTier    // Downgrade when budget exceeded
+}
+
+func (cm *CostManager) Route(ctx context.Context, task Task, agentID string) (ModelCall, error) {
+    budget := cm.agentBudgets[agentID]
+    
+    // 1. Check budget
+    if budget.CurrentSpend >= budget.MonthlyLimit {
+        return cm.fallbackToCheapModel(task)
+    }
+    
+    // 2. Check if approaching limit
+    if budget.CurrentSpend >= budget.AlertThreshold*budget.MonthlyLimit {
+        cm.notifyBudgetWarning(agentID, budget)
+    }
+    
+    // 3. Select model based on task complexity
+    model := cm.router.Select(task)
+    
+    // 4. Check if subscription tier covers this model
+    if !cm.tierCoversModel(budget.DefaultTier, model) {
+        // Downgrade to cheaper model or switch to API
+        model = cm.findAlternative(model, budget.DefaultTier)
+    }
+    
+    return cm.callModel(ctx, model, task)
+}
+
+func (cm *CostManager) SelectModel(task Task) string {
+    switch task.Complexity {
+    case "simple":
+        return "gpt-3.5-turbo"        // ~$0.0015/1K tokens
+    case "standard":
+        return "gpt-4o-mini"          // ~$0.0006/1K tokens
+    case "complex":
+        return "claude-3.5-sonnet"    // ~$0.003/1K input
+    case "coding":
+        return "claude-3.5-sonnet"    // Best for code
+    case "reasoning":
+        return "gpt-4o"               // ~$0.005/1K input
+    case "analysis":
+        return "kimi/kimi-code"       // Long context
+    default:
+        return "gpt-4o-mini"          // Default cheap
+    }
+}
+```
+
+### 12.5 Optimization Strategies
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| **Model routing** | 5-10x | Simple tasks → cheap models |
+| **Prompt caching** | 2-5x | Cache system prompts, repeated queries |
+| **Response caching** | 2-10x | Cache identical requests |
+| **Batching** | 50% | OpenAI batch API (24h delay) |
+| **Streaming** | 10-20% | Cancel if user disconnects |
+| **Context trimming** | 20-40% | Drop old messages, summarize |
+| **Function caching** | 30-50% | Cache tool results |
+
+### 12.6 Billing Abstraction
+
+```go
+type BillingBackend interface {
+    Name() string                    // "openai_api", "anthropic_api", "azure_openai"
+    
+    // Authentication
+    Authenticate(ctx context.Context, creds Credentials) error
+    
+    // Cost tracking
+    TrackUsage(ctx context.Context, usage TokenUsage) error
+    GetCurrentSpend(ctx context.Context) (float64, error)
+    
+    // Model availability
+    AvailableModels(ctx context.Context) ([]Model, error)
+    GetCostPerToken(model string) (inputCost, outputCost float64, err error)
+    
+    // Switching
+    CanHandle(model string) bool
+    EstimateCost(prompt string, model string) (float64, error)
+}
+
+// Backends:
+// - OpenAISubscriptionBackend (web UI automation - not recommended for production)
+// - OpenAIAPIBackend (pay-per-token)
+// - AnthropicAPIBackend (pay-per-token)
+// - AzureOpenAIBackend (committed use, cheaper)
+// - KimiAPIBackend (alternative provider)
+```
+
+### 12.7 Cost Dashboard Metrics
+
+```
+Per Agent:
+- Monthly spend
+- Tokens used (input/output)
+- Cost per run
+- Model distribution
+- Budget remaining
+
+Per Team:
+- Aggregated spend
+- Top agents by cost
+- Cost vs value (tasks completed)
+
+Platform-wide:
+- Total monthly burn
+- Cost per task type
+- Optimization opportunities
+- Subscription vs API ratio
+```
+
+### 12.8 Subscription → API Migration Path
+
+```yaml
+# Initial config (subscription phase)
+billing:
+  mode: subscription          # subscription | api | hybrid
+  default_tier: pro           # free | plus | pro
+  
+  subscription:
+    openai:
+      tier: pro               # ChatGPT Plus/Pro
+      seats: 5                # Number of users
+    anthropic:
+      tier: pro               # Claude Pro
+      seats: 3
+
+  # API fallback for models not in subscription
+  api_fallback:
+    enabled: true
+    provider: openai
+    budget_limit: 100         # $100/mo max API spend
+    alert_at: 80              # Alert at 80% of budget
+
+---
+# Phase 2 config (hybrid)
+billing:
+  mode: hybrid
+  
+  subscription:
+    openai:
+      tier: plus
+      seats: 2                # Reduce seats, move to API
+  
+  api:
+    primary: openai
+    fallback: anthropic
+    budget_per_agent: 50      # $50/mo per agent
+
+---
+# Phase 3 config (API-only)
+billing:
+  mode: api
+  provider: azure_openai      # 20-40% cheaper than direct API
+  committed_use: 1000         # $1K/mo commitment
+  
+  cost_controls:
+    max_cost_per_run: 0.50    # $0.50 max per request
+    daily_budget_per_agent: 10 # $10/day per agent
+    model_routing: enabled
+    caching: enabled
+    batching: enabled
+```
+
+## 13. MVP Scope
 
 **Phase 1: Core**
 - [ ] PostgreSQL schema

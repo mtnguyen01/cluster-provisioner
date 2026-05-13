@@ -276,7 +276,51 @@ providers:
 
 ---
 
-## 10. MVP Scope
+## 10. Cost Management
+
+### 10.1 Subscription → API Strategy
+
+For early testing, use subscription tiers (ChatGPT Plus/Claude Pro). For production, switch to API with cost optimization.
+
+```yaml
+# Phase 1: Subscription (testing)
+billing:
+  mode: subscription
+  tiers:
+    openai: plus      # $20/mo
+    anthropic: pro    # $20/mo
+
+# Phase 2: Hybrid (transition)
+billing:
+  mode: hybrid
+  subscription:
+    openai: plus      # Keep for human testing
+  api:
+    provider: openai  # For automated provisioning
+    budget_limit: 200  # $200/mo
+
+# Phase 3: API-only (production)
+billing:
+  mode: api
+  provider: azure_openai  # 20-40% cheaper
+  committed_use: 1000     # $1K/mo commitment
+  
+  cost_controls:
+    max_cost_per_provision: 5.00    # $5 max per cluster
+    daily_budget: 50                 # $50/day platform-wide
+```
+
+### 10.2 Cost Optimization
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| Model routing | 5-10x | Simple tasks → GPT-3.5 |
+| Prompt caching | 2-5x | Cache repeated queries |
+| Response caching | 2-10x | Cache identical requests |
+| Batching | 50% | Batch API for non-urgent |
+| Context trimming | 20-40% | Drop old messages |
+
+## 11. MVP Scope
 
 - [ ] PostgreSQL schema + migrations
 - [ ] Hetzner + Scaleway providers
